@@ -1,0 +1,928 @@
+---
+title: "Curated CellxGene retrieval and sampling time signature scoring"
+author: "Rahul"
+output: html_document
+date: "2024-05-15"
+---
+
+A simple algorithm to detect a gene signature meant to represent the storage time effect (https://doi.org/10.1186/s13059-020-02032-0) and then to try and remove it.
+
+This file is for windows and was made to be run on my personal computer. The linux equivalent is in my folder (hg-funcgenom-research/rrpadala) and utilises better multi-threading.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(cellxgenedp)
+library(UCell)
+library(Seurat)
+library(CuratedAtlasQueryR)
+library(dplyr)
+library(BiocParallel)
+library(SingleCellExperiment)
+library(tidyverse)
+library(readxl)
+library(scater)
+library(patchwork)
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+library(xlsx)
+library(ensembldb)
+library(EnsDb.Hsapiens.v86)
+library(DescTools)
+library(parallel)
+library(GSEABase)
+library(GOSemSim)
+library(GO.db)
+library(clusterProfiler)
+library(ensembldb)
+library(EnsDb.Hsapiens.v86)
+library(hgu95av2.db)
+library(enrichplot)
+library(ReactomePA)
+library(DOSE)
+library(AnnotationHub)
+library(scIntegrationMetrics)
+```
+
+Read the gene signature list and reformat the data.
+```{r}
+time<-vector("list",13)
+time[[1]]<-Sys.time()
+
+#Capped at 12 to be safe
+ncores<-min(parallel::detectCores(),13)
+ncores<-ncores-1
+
+cachedir<-"raw/CuratedAtlasQueryR/0.2.1"
+
+#Reads the gene expression changes provided by Massoni-Badosa et. al. (2020) in their supplementary files
+genesigs <- list(
+  pbmc = read_excel("Massoni-Badosa data/13059_2020_2032_MOESM2_ESM.xlsx", sheet="PBMC"),
+  CLL = read_excel("Massoni-Badosa data/13059_2020_2032_MOESM2_ESM.xlsx", sheet="CLL"),
+  Tcell = read_excel("Massoni-Badosa data/13059_2020_2032_MOESM2_ESM.xlsx", sheet="T-cell"),
+  NK = read_excel("Massoni-Badosa data/13059_2020_2032_MOESM2_ESM.xlsx", sheet="NK"),
+  monocyte = read_excel("Massoni-Badosa data/13059_2020_2032_MOESM2_ESM.xlsx", sheet="Monocyte"),
+  Bcell = read_excel("Massoni-Badosa data/13059_2020_2032_MOESM2_ESM.xlsx", sheet="B-cell")
+)
+
+#Reformat to get rid of extra space
+genesigs <- lapply(genesigs, function(x) {
+  x<-x[-1,]
+  colnames(x)<-x[1,]
+  x<-x[-1,]
+})
+
+#Only take some genes
+genesigs <- lapply(genesigs, function(x) {
+  x$log2_fc<-as.numeric(x$log2_fc)
+  x$average_expression<-as.numeric(x$average_expression)
+  x$p_val<-as.numeric(x$p_val)
+  x$p_val_adj<-as.numeric(x$p_val_adj)
+  x<-sort_by(x, x$log2_fc, decreasing=T)
+})
+
+ntop<-list(
+  pbmc = 0,
+  CLL = 0,
+  Tcell = 0,
+  NK = 0,
+  monocyte = 0,
+  Bcell = 0
+)
+
+ntopcent<-list(
+  pbmc = 0,
+  CLL = 0,
+  Tcell = 0,
+  NK = 0,
+  monocyte = 0,
+  Bcell = 0
+)
+
+nbot<-list(
+  pbmc = 0,
+  CLL = 0,
+  Tcell = 0,
+  NK = 0,
+  monocyte = 0,
+  Bcell = 0
+)
+
+nbotcent<-list(
+  pbmc = 0,
+  CLL = 0,
+  Tcell = 0,
+  NK = 0,
+  monocyte = 0,
+  Bcell = 0
+)
+
+defaultflag <- F
+
+for(i in 1:length(genesigs)) {
+  botmax<-nrow(dplyr::filter(genesigs[[i]], log2_fc<0))
+  topmax<-nrow(dplyr::filter(genesigs[[i]], log2_fc>0))
+    while(ntop[[i]]<1||ntop[[i]]>topmax) {
+    ntop[[i]]<-as.numeric(readline(prompt=paste("How many of the top upregulated genes do you want in the ",names(genesigs)[i] ," signature? Max: ",topmax,".",sep="")))
+    ntopcent[[i]]<-round((ntop[[i]]/topmax)*100)
+    if(ntop[[i]]==(-1)) {
+      defaultflag <- T
+      break
+    }
+  }
+  while(nbot[[i]]<1||nbot[[i]]>botmax) {
+    nbot[[i]]<-as.numeric(readline(prompt=paste("How many of the bottom downregulated genes do you want in the ",names(genesigs)[i] ," signature? Max: ",botmax,".",sep="")))
+    nbotcent[[i]]<-round((nbot[[i]]/botmax)*100)
+    if(nbot[[i]]==(-1)) {
+      defaultflag <- T
+      break
+    }
+  }
+  if(ntop[[i]]==(-1)||nbot[[i]]==(-1)) {
+    defaultflag <- T
+    break
+  }
+}
+
+if(defaultflag) {
+  ntop<-list(
+    pbmc = 100,
+    CLL = 100,
+    Tcell = 100,
+    NK = 100,
+    monocyte = 100,
+    Bcell = 23
+  )
+  nbot<-list(
+    pbmc = 100,
+    CLL = 100,
+    Tcell = 100,
+    NK = 100,
+    monocyte = 100,
+    Bcell = 75
+  )
+}
+
+ncat <- 0
+minset <- 0
+maxset <- 0
+
+while(ncat<1||ncat>25) {
+  ncat<-as.numeric(readline(prompt="For the purposes of GSEA of the storage time effect, how many enrichment categories do you want?"))
+  if(ncat<1) {
+    message("You must have at least one category to display.")
+  }
+  if(ncat>25) {
+    message("Too many categories make the graphs hard to read.")
+  }
+  if(ncat==(-1)) {
+    ncat <- 15
+    break
+  }
+}
+
+while(minset<1) {
+  minset<-as.numeric(readline(prompt="For the purposes of GSEA of the storage time effect, what is your desired minimum gene set size. Recommended: 5"))
+  if(minset==1) {
+    message("It's not a 'set' if it's just one gene")
+  }
+  if(minset==(-1)) {
+    minset <- 5
+    break
+  }
+}
+
+while(maxset<1||maxset<minset) {
+  maxset<-as.numeric(readline(prompt="For the purposes of GSEA of the storage time effect, what is your desired maximum gene set size. Recommended: 100"))
+  if(maxset==1) {
+    message("It's not a 'set' if it's just one gene")
+  }
+  if(maxset<minset) {
+    message("Must exceed or equal minimum gene set size")
+  }
+  if(maxset==(-1)) {
+    maxset <- 100
+    break
+  }
+}
+
+mostsig<-vector("list",length(genesigs))
+for(i in 1:length(genesigs)) {
+  top<-genesigs[[i]][1:ntop[[i]],]
+  a<-length(genesigs[[i]]$gene)
+  bottom<-genesigs[[i]][(a-nbot[[i]]+1):a,]
+  mostsig[[i]]<-rbind(top,bottom)
+}
+names(mostsig)<-names(genesigs)
+
+#Ensembl IDs just in case
+ensgenesigs<-lapply(mostsig, function(x){
+  x$gene<-mapIds(EnsDb.Hsapiens.v86, keys=x$gene, keytype = "GENENAME", columns="GENEID")
+  x
+})
+
+mostsig <- lapply(mostsig, function(x){
+  neg<-dplyr::filter(x, log2_fc<0)
+  neg$gene<-paste(neg$gene,"-",sep="")
+  pos<-dplyr::filter(x, log2_fc>0)
+  pos$gene<-paste(pos$gene,"+",sep="")
+  rbind(pos,neg)
+})
+
+ensgenesigs <- lapply(ensgenesigs, function(x){
+  neg<-dplyr::filter(x, log2_fc<0)
+  neg$gene<-paste(neg$gene,"-",sep="")
+  pos<-dplyr::filter(x, log2_fc>0)
+  pos$gene<-paste(pos$gene,"+",sep="")
+  rbind(pos,neg)
+})
+
+#Type 1 Interferon to test certain COVID-19 datasets
+Type1InterferonUP <- read_csv("Type1InterferonUP.txt", col_names = F)
+Type1InterferonDOWN <- read_csv("Type1InterferonDOWN.txt", col_names = F)
+Type1Interferonsignature <- list(
+  UP = unique(Type1InterferonUP$X1),
+  DOWN = unique(Type1InterferonDOWN$X1)
+)
+
+#Signatures with gene names
+samplingtimesignatures <- list(
+    pbmc = mostsig$pbmc$gene,
+    CLL = mostsig$CLL$gene,
+    Tcell = mostsig$Tcell$gene,
+    NK = mostsig$NK$gene,
+    mono = mostsig$monocyte$gene,
+    Bcell = mostsig$Bcell$gene,
+    T1f = Type1InterferonUP$X1
+)
+
+#Signatures with ensmbl IDs
+enssamplingtimesignatures <- list(
+    pbmc = ensgenesigs$pbmc$gene,
+    CLL = ensgenesigs$CLL$gene,
+    Tcell = ensgenesigs$Tcell$gene,
+    NK = ensgenesigs$NK$gene,
+    mono = ensgenesigs$monocyte$gene,
+    Bcell = ensgenesigs$Bcell$gene
+)
+```
+
+Read from the curated atlast db and pull the data we want
+```{r}
+#Downloads the latest version of the Curated Atlas Database and extracts certain metadata elements
+db<-db()
+
+#Remember to change directories if you don't want large raw data files here
+metadata <- get_metadata(cache_directory=cachedir)
+time[[2]]<-Sys.time()
+
+tissuefilt<-readline(prompt="Input tissue type or \"all\" for all tissues. Type \"list\" for tissue list.")
+
+while(!any(str_detect(dplyr::pull(dplyr::distinct(metadata,tissue),tissue),tissuefilt))) {
+  if(tissuefilt=="list") {
+    print(dplyr::pull(dplyr::distinct(metadata,tissue),tissue))
+  }
+  if(tissuefilt=="stop"||tissuefilt=="all") {
+    break
+  }
+  tissuefilt<-readline(prompt="Input tissue type or \"all\" for all tissues. Type \"list\" for tissue list.")
+}
+
+if(tissuefilt=="all") {
+  curateddb<-as.list(dplyr::pull(dplyr::distinct(metadata,file_id),file_id))
+} else {
+  curateddb<-as.list(dplyr::pull(dplyr::distinct(dplyr::filter(metadata,tissue==tissuefilt),file_id),file_id))
+}
+
+names(curateddb)<-curateddb
+curateddb<-lapply(curateddb, function(x) {
+  curateddb$x <- list(Name="unknown",`File ID`=x,Sex="unknown",`Unique Sexes`=0,Ethnicity="unknown",`Unique Ethnicities`=0,Disease="normal",`Unique Diseases`=0,Cells=0,Samples=0,`Healthy Samples`=0,`Mean Age`=0,`Min Age`=0,`Max Age`=0,Data="unkown.cxg")
+  curateddb$x$Sex <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),sex),sex)
+  curateddb$x$`Unique Sexes` <- length(stringr::str_subset(curateddb$x$Sex,"unknown",negate=T))
+  curateddb$x$Ethnicity <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),ethnicity),ethnicity)
+  curateddb$x$`Unique Ethnicities` <- length(stringr::str_subset(curateddb$x$Ethnicity,"unknown",negate=T))
+  temp <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),age_days),age_days)
+  curateddb$x$`Mean Age` <- (mean(temp,na.rm=T))/365.2425
+  curateddb$x$`Min Age` <- (min(temp,na.rm=T))/365.2425
+  curateddb$x$`Max Age` <- (max(temp,na.rm=T))/365.2425
+  curateddb$x$Disease <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),disease),disease)
+  curateddb$x$`Unique Diseases` <- length(stringr::str_subset(curateddb$x$Disease,"normal",negate=T))
+  curateddb$x$Cells <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),cell_count),cell_count)
+  temp <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),sample_),sample_)
+  curateddb$x$Samples <- length(temp)
+  temp <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x&&disease=="normal"),sample_),sample_)
+  curateddb$x$`Healthy Samples` <- length(temp)
+  curateddb$x$Data <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),dataset_deployments),dataset_deployments)
+  curateddb$x$Name <- dplyr::pull(dplyr::distinct(dplyr::filter(metadata,file_id==x),name),name)
+  curateddb$x
+})
+```
+
+```{r}
+#Writes the metadata to a local file
+wb <- createWorkbook(type="xlsx")
+sheetcxg <- createSheet(wb, sheetName = "Curated CellxGene")
+sheetcxg2 <- createSheet(wb, sheetName = "Curated CellxGene Alt Format")
+header<-c("Curated CellxGene Database from stemangiola.github.io/CuratedAtlasQueryR/",paste("Tissue chosen:",tissuefilt,sep=" ") ,paste("Data retrieved at:",toString(time[[2]]),sep=" "))
+
+cstyle <- CellStyle(
+  wb,
+  fill = Fill(foregroundColor = "#ACB9CA",backgroundColor = "#ACB9CA",pattern = "SOLID_FOREGROUND"),
+)
+
+#Sheet one in list format for easy sorting
+addDataFrame(
+  x=header,
+  sheet=sheetcxg,
+  startRow = 1,
+  startColumn = 1,
+  col.names = F,
+  row.names = F,
+  byrow = T
+)
+
+k<-1
+l<-4
+m<-T
+for(i in 1:length(curateddb)) {
+  temp<-curateddb[[i]]
+  for(j in 1:length(temp)) {
+    temp2<-as.data.frame(toString(temp[[j]]))
+    rownames(temp2)<-names(temp)[j]
+    if(i!=1) m=F
+    addDataFrame(
+      x=temp2,
+      sheet=sheetcxg,
+      startRow = l,
+      startColumn = k,
+      rownamesStyle = cstyle,
+      col.names = F,
+      row.names = m,
+      byrow = T
+    )
+    k<-k+1
+  }
+  k<-1
+  l<-l+1
+}
+
+#Sheet two in table format for easy viewing
+addDataFrame(
+  x=header,
+  sheet=sheetcxg2,
+  startRow = 1,
+  startColumn = 1,
+  col.names = F,
+  row.names = F,
+  byrow = T
+)
+
+k<-3
+l<-1
+m<-0
+for(i in 1:length(curateddb)) {
+  temp<-curateddb[[i]]
+  for(j in 1:length(temp)) {
+    temp2<-as.data.frame(as.character(temp[[j]]))
+    colnames(temp2)<-names(temp)[j]
+    m<-max(m,length(temp[[j]]))
+    addDataFrame(
+      x=temp2,
+      sheet=sheetcxg2,
+      startRow = k,
+      startColumn = l,
+      colnamesStyle = cstyle,
+      col.names = T,
+      row.names = F,
+      byrow = T
+    )
+    k<-k+1
+  }
+  k<-k+1
+  if(i%%round(sqrt(length(curateddb)),0)==0) {
+    k<-3
+    l<-l+m+2
+    m<-0
+  }
+}
+
+saveWorkbook(wb, file="RNAseqDataBase.xlsx")
+message("Workbook saved as RNAseqDataBase in current folder.")
+```
+
+Pre-calculates gene ranks. Use small datasets (<100k cells) on Windows. Or not depending on your hardware.
+```{r}
+#for testing :e6c69fdf-a559-4926-9d02-8b3e26fcf643 (doesn't have storage effect)
+#a0396bf6-cd6d-42d9-b1b5-c66b19d312ae (does have storage effect)
+fileid<-readline(prompt="Using the RNAseqDataBase file created, input the file id. Type \"list\" for a nondescriptive list.")
+
+while(!any(str_detect(names(curateddb),fileid))) {
+  if(fileid=="list") {
+    print(names(curateddb))
+  }
+  if(fileid=="stop") {
+    break
+  }
+  fileid<-readline(prompt="Using the RNAseqDataBase file created, input the file id. Type list for a nondescriptive list.")
+}
+
+time[[3]]<-Sys.time()
+
+#Remember to change directories if you don't want large raw data files here
+#Pre calculates ranks to save time later
+
+cl<-SnowParam(workers=ncores,type="SOCK",progressbar=T,timeout=600,log=T,logdir="debug/parallelization")
+
+if(tissuefilt=="all") {
+      single_cell_counts = 
+      metadata |>
+      dplyr::filter(
+      file_id == fileid
+    ) |>
+    get_single_cell_experiment(cache_directory=cachedir)
+} else {
+      single_cell_counts = 
+      metadata |>
+      dplyr::filter(
+      file_id == fileid &&
+      tissue == tissuefilt
+    ) |>
+    get_single_cell_experiment(cache_directory=cachedir)
+}
+
+if(checkmate::testFileExists(paste(cachedir,fileid,"ranks.rds",sep="/"),access="r")) {
+  ucellranks<-readRDS(file=paste(cachedir,fileid,"ranks.rds",sep="/"))
+} else {
+  ucellranks<-StoreRankings_UCell(single_cell_counts, maxRank = 1500, BPPARAM = cl)
+  dir.create(paste(cachedir,fileid,sep="/"))
+  saveRDS(ucellranks,file=paste(cachedir,fileid,"ranks.rds",sep="/"))
+}
+```
+
+Calculates the gene signature scores using UCell
+```{r}
+time[[4]]<-Sys.time()
+
+#Calculates scores for all possible combinations of cell types and signatures
+genenames<-single_cell_counts@assays@data@listData$counts@seed@dimnames[[1]]
+if(any(str_detect(genenames,"ENSG"))) {
+  scores <- ScoreSignatures_UCell(features = enssamplingtimesignatures, precalc.ranks = ucellranks, assay = "counts", name = NULL, w_neg=0.5, BPPARAM = SnowParam(workers=ncores,progressbar=T))
+} else {
+  scores <- ScoreSignatures_UCell(features = samplingtimesignatures, precalc.ranks = ucellranks, assay = "counts", name = NULL, w_neg=0.5, BPPARAM = SnowParam(workers=ncores,progressbar=T))
+}
+
+time[[5]]<-Sys.time()
+
+#Add in metadata
+summexp<-single_cell_counts@colData@listData
+md<-list(summexp$original_cell_id,summexp$cell_type,summexp$sex,summexp$age_days,summexp$ethnicity,summexp$disease,summexp$development_stage,summexp$sample_)
+names(md)<-c("Cell", "Cell_type", "Sex", "Age", "Ethnicity", "Disease", "Developmental_stage", "Sample")
+md<-as.data.frame(md)
+scores<-as.data.frame(scores)
+scores<-cbind(rownames(scores),scores)
+rownames(scores)<-NULL
+colnames(scores) <- c("Cell","PBMC scores","CLL scores", "T cell scores", "NK cell scores", "Monocyte scores", "B cell scores", "T1f scores")
+scores$Cell<-str_remove(scores$Cell,pattern = "_.$")
+mergedscores<-merge(scores,md,by.x="Cell",by.y="Cell")
+
+#Establish cell types
+celltypemono<-"monocyte$"
+celltypenk<-"(natural killer)|(^NK$)"
+celltypebcell<-"B cell"
+celltypetcell<-"(T cell)|(T-)"
+celltypepbmc<-"(monocyte$)|(natural killer)|(^NK$)|(B cell)|(T cell)|(T-)"
+
+#Only use score combinations that make sense
+scorelist <- list(
+  Bcell = dplyr::select(dplyr::filter(mergedscores, stringr::str_detect(Cell_type,celltypebcell)),c(!ends_with("scores"),starts_with("B cell"))),
+  Tcell = dplyr::select(dplyr::filter(mergedscores, stringr::str_detect(Cell_type,celltypetcell)),c(!ends_with("scores"),starts_with("T cell"))),
+  Monocyte = dplyr::select(dplyr::filter(mergedscores, stringr::str_detect(Cell_type,celltypemono)),c(!ends_with("scores"),starts_with("Monocyte"))),
+  NK = dplyr::select(dplyr::filter(mergedscores, stringr::str_detect(Cell_type,celltypenk)),c(!ends_with("scores"),starts_with("NK cell"))),
+  PBMC = dplyr::select(dplyr::filter(mergedscores, stringr::str_detect(Cell_type,celltypepbmc)),c(!ends_with("scores"),starts_with("PBMC"))),
+  T1f = dplyr::select(dplyr::filter(mergedscores, stringr::str_detect(Cell_type,celltypepbmc)),c(!ends_with("scores"),starts_with("T1f")))
+)
+scorelist<-lapply(scorelist, function(x){
+  colnames(x) <- c("Cell","Cell type","Sex", "Age", "Ethnicity", "Disease", "Developmental stage", "Sample", "Scores")
+  x
+})
+
+#Aggregates scores by sample
+aggregatedscores <- vector("list", length(scorelist))
+names(aggregatedscores) <- names(scorelist)
+for(i in 1:length(scorelist)){
+  temp<-NULL
+  if(nrow(scorelist[[i]])>1) {
+    temp <- aggregate(Scores~Sample,data=scorelist[[i]],mean)
+    aggregatedscores[[i]]<-unique.array(merge(scorelist[[i]][3:8],temp,by.x="Sample",by.y="Sample"))
+  }
+}
+
+#Plots and saves graphs
+#Pairwise comparisons might go up to 21 in the same graph. Revise code accordingly.
+p <- vector("list", length(aggregatedscores))
+for(i in 1:length(aggregatedscores)) {
+  if(!is.null(nrow(aggregatedscores[[i]]))) {
+    plotfile<-paste(names(aggregatedscores)[i],"sex.tiff",sep="_")
+    plotpath<-paste("results/plots/SamplingTimeScores/",fileid,sep="")
+    plottitle<-paste("Sampling Time Signature in ", names(aggregatedscores)[i],"s across sexes",sep="")
+    temp<-unique(aggregatedscores[[i]]$Sex)
+    if(length(temp)>1&&length(temp)<8) {
+      temp2<-CombSet(x=temp,m=2,as.list=T)
+      p[[i]] <- ggplot(aggregatedscores[[i]], aes(x=Sex, y=Scores)) + 
+      geom_violin(aes(fill=Sex), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      labs(title=plottitle) +
+      stat_compare_means(comparisons=temp2)
+    } else {
+      p[[i]] <- ggplot(aggregatedscores[[i]], aes(x=Sex, y=Scores)) + 
+      geom_violin(aes(fill=Sex), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      labs(title=plottitle)
+    }
+    ggsave(filename=plotfile,plot=p[[i]],device="tiff",path=plotpath,create.dir=T)
+  }
+}
+
+p <- vector("list", length(aggregatedscores))
+for(i in 1:length(aggregatedscores)) {
+  if(!is.null(nrow(aggregatedscores[[i]]))) {
+    plotfile<-paste(names(aggregatedscores)[i],"ethnicity.tiff",sep="_")
+    plotpath<-paste("results/plots/SamplingTimeScores/",fileid,sep="")
+    plottitle<-paste("Sampling Time Signature in ", names(aggregatedscores)[i],"s across ethnicities",sep="")
+    temp<-unique(aggregatedscores[[i]]$Ethnicity)
+    if(length(temp)>1&&length(temp)<8) {
+      temp2<-CombSet(x=temp,m=2,as.list=T)
+      p[[i]] <- ggplot(aggregatedscores[[i]], aes(x=Ethnicity, y=Scores)) + 
+      geom_violin(aes(fill=Ethnicity), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      labs(title=plottitle) +
+      stat_compare_means(comparisons=temp2)
+    } else {
+      p[[i]] <- ggplot(aggregatedscores[[i]], aes(x=Ethnicity, y=Scores)) + 
+      geom_violin(aes(fill=Ethnicity), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      labs(title=plottitle)
+    }
+    ggsave(filename=plotfile,plot=p[[i]],device="tiff",path=plotpath,create.dir=T)
+  }
+}
+
+p <- vector("list", length(aggregatedscores))
+for(i in 1:length(aggregatedscores)) {
+  if(!is.null(nrow(aggregatedscores[[i]]))) {
+    plotfile<-paste(names(aggregatedscores)[i],"disease.tiff",sep="_")
+    plotpath<-paste("results/plots/SamplingTimeScores/",fileid,sep="")
+    plottitle<-paste("Sampling Time Signature in ", names(aggregatedscores)[i],"s across diseases",sep="")
+    temp<-unique(aggregatedscores[[i]]$Disease)
+    if(length(temp)>1&&length(temp)<8) {
+      temp2<-CombSet(x=temp,m=2,as.list=T)
+      p[[i]] <- ggplot(aggregatedscores[[i]], aes(x=Disease, y=Scores)) + 
+      geom_violin(aes(fill=Disease), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      labs(title=plottitle) +
+      stat_compare_means(comparisons=temp2)
+    } else {
+      p[[i]] <- ggplot(aggregatedscores[[i]], aes(x=Disease, y=Scores)) + 
+      geom_violin(aes(fill=Disease), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      labs(title=plottitle)
+    }
+    ggsave(filename=plotfile,plot=p[[i]],device="tiff",path=plotpath,create.dir=T)
+  }
+}
+time[[6]]<-Sys.time()
+```
+
+Computational correction of storage time effect.
+```{r}
+#Removing the storage time effect
+
+seurat1 <- as.Seurat(single_cell_counts, counts = "counts", data = NULL)
+seurat1 <- NormalizeData(seurat1)
+
+time[[7]]<-Sys.time()
+
+seurat1 <- AddModuleScore_UCell(seurat1, features = samplingtimesignatures, w_neg = 0.5, slot = "data", name = NULL, BPPARAM = SerialParam(progressbar=T))
+
+seurat1$cell_type_cons <- "unassigned"
+seurat1$cell_type_cons[stringr::str_detect(seurat1$cell_type,celltypemono)]<-"mono"
+seurat1$cell_type_cons[stringr::str_detect(seurat1$cell_type,celltypenk)]<-"NK"
+seurat1$cell_type_cons[stringr::str_detect(seurat1$cell_type,celltypebcell)]<-"Bcell"
+seurat1$cell_type_cons[stringr::str_detect(seurat1$cell_type,celltypetcell)]<-"Tcell"
+
+seurat1$ucell_score_cons <- 0
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="mono"]<-seurat1$mono[seurat1$cell_type_cons=="mono"]
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="NK"]<-seurat1$NK[seurat1$cell_type_cons=="NK"]
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="Bcell"]<-seurat1$Bcell[seurat1$cell_type_cons=="Bcell"]
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="Tcell"]<-seurat1$Tcell[seurat1$cell_type_cons=="Tcell"]
+
+temp<-as.data.frame(seurat1$ucell_score_cons[seurat1$cell_type_cons!="unassigned"])
+temp<-cbind(temp,seurat1$disease[seurat1$cell_type_cons!="unassigned"])
+colnames(temp)<-c("Sampling Time Score","Disease")
+
+p1 <- ggplot(temp, aes(x=Disease, y=`Sampling Time Score`)) + 
+      geom_violin(aes(fill=Disease), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank())
+
+seurat1 <- FindVariableFeatures(seurat1, selection.method = "vst")
+seurat2 <- ScaleData(seurat1, split.by = "cell_type_cons", vars.to.regress = "ucell_score_cons")
+seurat1 <- ScaleData(seurat1, split.by = "cell_type_cons")
+
+time[[8]]<-Sys.time()
+
+seurat1 <- AddModuleScore_UCell(seurat1, features = samplingtimesignatures, w_neg = 0.5, slot = "scale.data", name = NULL, BPPARAM = SerialParam(progressbar=T))
+seurat2 <- AddModuleScore_UCell(seurat2, features = samplingtimesignatures, w_neg = 0.5, slot = "scale.data", name = NULL, BPPARAM = SerialParam(progressbar=T))
+
+time[[9]]<-Sys.time()
+
+seurat1$ucell_score_cons <- 0
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="mono"]<-seurat1$mono[seurat1$cell_type_cons=="mono"]
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="NK"]<-seurat1$NK[seurat1$cell_type_cons=="NK"]
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="Bcell"]<-seurat1$Bcell[seurat1$cell_type_cons=="Bcell"]
+seurat1$ucell_score_cons[seurat1$cell_type_cons=="Tcell"]<-seurat1$Tcell[seurat1$cell_type_cons=="Tcell"]
+
+seurat2$ucell_score_cons <- 0
+seurat2$ucell_score_cons[seurat2$cell_type_cons=="mono"]<-seurat2$mono[seurat2$cell_type_cons=="mono"]
+seurat2$ucell_score_cons[seurat2$cell_type_cons=="NK"]<-seurat2$NK[seurat2$cell_type_cons=="NK"]
+seurat2$ucell_score_cons[seurat2$cell_type_cons=="Bcell"]<-seurat2$Bcell[seurat2$cell_type_cons=="Bcell"]
+seurat2$ucell_score_cons[seurat2$cell_type_cons=="Tcell"]<-seurat2$Tcell[seurat2$cell_type_cons=="Tcell"]
+
+temp<-as.data.frame(seurat1$ucell_score_cons[seurat1$cell_type_cons!="unassigned"])
+temp<-cbind(temp,seurat1$disease[seurat1$cell_type_cons!="unassigned"])
+temp<-cbind(temp,seurat1$sample_[seurat1$cell_type_cons!="unassigned"])
+colnames(temp)<-c("Sampling Time Score","Disease", "Sample")
+tempagg<-aggregate(`Sampling Time Score`~Sample,data=temp,mean)
+tempagg<-unique.array(merge(temp[,2:3],tempagg,by.x="Sample",by.y="Sample"))
+
+p2 <- ggplot(temp, aes(x=Disease, y=`Sampling Time Score`)) + 
+      geom_violin(aes(fill=Disease), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank())
+
+temp<-as.data.frame(seurat2$ucell_score_cons[seurat2$cell_type_cons!="unassigned"])
+temp<-cbind(temp,seurat2$disease[seurat2$cell_type_cons!="unassigned"])
+temp<-cbind(temp,seurat2$sample_[seurat2$cell_type_cons!="unassigned"])
+colnames(temp)<-c("Sampling Time Score","Disease", "Sample")
+tempagg2<-aggregate(`Sampling Time Score`~Sample,data=temp,mean)
+tempagg2<-unique.array(merge(temp[,2:3],tempagg2,by.x="Sample",by.y="Sample"))
+
+p3 <- ggplot(temp, aes(x=Disease, y=`Sampling Time Score`)) + 
+      geom_violin(aes(fill=Disease), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank())
+
+temp<-unique(tempagg$Disease)
+temp2<-CombSet(x=temp,m=2,as.list=T)
+
+p4 <- ggplot(tempagg, aes(x=Disease, y=`Sampling Time Score`)) + 
+      geom_violin(aes(fill=Disease), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      stat_compare_means(comparisons=temp2)
+
+p5 <- ggplot(tempagg2, aes(x=Disease, y=`Sampling Time Score`)) + 
+      geom_violin(aes(fill=Disease), scale = "width") +
+      geom_boxplot(width=0.1, outlier.size=0) +
+      theme_bw() + theme(axis.text.x=element_blank()) +
+      stat_compare_means(comparisons=temp2)
+
+ggsave(filename="Storage Scores before any processing.tiff",plot=p1,device="tiff",path=plotpath,create.dir=T)
+ggsave(filename="Uncorrected Storage Scores.tiff",plot=p2,device="tiff",path=plotpath,create.dir=T)
+ggsave(filename="Corrected Storage Scores.tiff",plot=p3,device="tiff",path=plotpath,create.dir=T)
+ggsave(filename="Uncorrected Aggregated Storage Scores.tiff",plot=p4,device="tiff",path=plotpath,create.dir=T)
+ggsave(filename="Corrected Aggregated Storage Scores.tiff",plot=p5,device="tiff",path=plotpath,create.dir=T)
+```
+
+Data mining the effects of removing the storage effect.
+```{r}
+#GSEA on the storage time effect
+
+time[[10]]<-Sys.time()
+
+hsGOBP <- godata(annoDb = 'org.Hs.eg.db', keytype = "SYMBOL", ont="BP", computeIC=FALSE) 
+hsGOMF <- godata(annoDb = 'org.Hs.eg.db', keytype = "SYMBOL", ont="MF", computeIC=FALSE) 
+hsGOCC <- godata(annoDb = 'org.Hs.eg.db', keytype = "SYMBOL", ont="CC", computeIC=FALSE)
+
+temp <- log2(1+expm1(seurat1@assays[["originalexp"]]@scale.data-seurat2@assays[["originalexp"]]@scale.data))
+
+generanklist <- list(
+  mono = vector("numeric",length=nrow(temp)),
+  NK = vector("numeric",length=nrow(temp)),
+  Bcell = vector("numeric",length=nrow(temp)),
+  Tcell = vector("numeric",length=nrow(temp))
+)
+
+for(i in 1:length(generanklist)) {
+  names(generanklist[[i]]) <- rownames(temp)
+}
+
+for(i in 1:length(generanklist)) {
+  for(j in 1:nrow(temp)) {
+    generanklist[[i]][j] <- mean(temp[j,seurat1$cell_type_cons==names(generanklist)[i]])
+  }
+  generanklist[[i]] <- sort(generanklist[[i]], decreasing=T)
+  p <- ggplot(as.data.frame(generanklist[[i]]), aes(generanklist[[i]])) + geom_histogram(bins=100) + xlab(paste("Storage Effect log2fc",names(generanklist)[i],sep=" "))
+  ggsave(filename=paste("Storage Effect log2fc ",names(generanklist)[i],".tiff",sep=""),plot=p,device="tiff",path=plotpath,create.dir=T)
+}
+
+saveRDS(generanklist, file=paste(plotpath,"ranked gene list",sep = "/"))
+
+entgeneranklist <- generanklist
+unpgeneranklist <- generanklist
+
+for(i in 1:length(generanklist)) {
+  temp <- generanklist[[i]]
+  names(temp) <- mapIds(hgu95av2.db, keys=names(generanklist[[i]]), column=c("ENTREZID"), keytype="SYMBOL")
+  temp2<-is.na(names(temp))
+  temp3<-temp[!temp2]
+  temp4<-duplicated(names(temp3))
+  temp5<-temp3[!temp4]
+  temp5<-sort(temp5, decreasing = TRUE)
+  entgeneranklist[[i]] <- temp5
+}
+
+for(i in 1:length(generanklist)) {
+  temp <- generanklist[[i]]
+  names(temp) <- mapIds(hgu95av2.db, keys=names(generanklist[[i]]), column=c("UNIPROT"), keytype="SYMBOL")
+  temp2<-is.na(names(temp))
+  temp3<-temp[!temp2]
+  temp4<-duplicated(names(temp3))
+  temp5<-temp3[!temp4]
+  temp5<-sort(temp5, decreasing = TRUE)
+  unpgeneranklist[[i]] <- temp5
+}
+
+temppath<-paste(plotpath,"GSEA",sep="/")
+
+#Gene Ontology Biological Process
+ggobp <- lapply(entgeneranklist, gseGO, OrgDb = "org.Hs.eg.db", ont = "BP", keyType = "ENTREZID", minGSSize = minset, maxGSSize = maxset)
+ggobpr <- lapply(ggobp, function(x){
+  temp <- dplyr::filter(x@result,p.adjust<=0.05)
+  return(temp)
+})
+
+for(i in 1:length(ggobp)) {
+  if(nrow(ggobpr[[i]])>0) {
+    p<-ridgeplot(ggobp[[i]], showCategory = ncat)
+    ggsave(filename=paste(names(ggobp)[i],"GO_BP.tiff",sep="_"),plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+  }
+}
+
+#Gene Ontology Cellular Component
+ggocc <- lapply(entgeneranklist, gseGO, OrgDb = "org.Hs.eg.db", ont = "CC", keyType = "ENTREZID", minGSSize = minset, maxGSSize = maxset)
+ggoccr <- lapply(ggocc, function(x){
+  temp <- dplyr::filter(x@result,p.adjust<=0.05)
+  return(temp)
+})
+
+for(i in 1:length(ggocc)) {
+  if(nrow(ggoccr[[i]])>0) {
+    p<-ridgeplot(ggocc[[i]], showCategory = ncat)
+    ggsave(filename=paste(names(ggobp)[i],"GO_CC.tiff",sep="_"),plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+  }
+}
+
+#Gene Ontology Molecular Function
+ggomf <- lapply(entgeneranklist, gseGO, OrgDb = "org.Hs.eg.db", ont = "MF", keyType = "ENTREZID", minGSSize = minset, maxGSSize = maxset)
+ggomfr <- lapply(ggomf, function(x){
+  temp <- dplyr::filter(x@result,p.adjust<=0.05)
+  return(temp)
+})
+
+for(i in 1:length(ggomf)) {
+  if(nrow(ggomfr[[i]])>0) {
+    p<-ridgeplot(ggomf[[i]], showCategory = ncat)
+    ggsave(filename=paste(names(ggomf)[i],"GO_MF.tiff",sep="_"),plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+  }
+}
+
+#Reactome
+grct <- lapply(entgeneranklist, gsePathway, organism = "human", minGSSize = minset, maxGSSize = maxset)
+grctr <- lapply(grct, function(x){
+  temp <- dplyr::filter(x@result,p.adjust<=0.05)
+  return(temp)
+})
+
+for(i in 1:length(grct)) {
+  if(nrow(grctr[[i]])>0) {
+    p<-ridgeplot(grct[[i]], showCategory = ncat)
+    ggsave(filename=paste(names(grct)[i],"Reactome.tiff",sep="_"),plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+  }
+}
+
+#WikiPathway
+gwpw <- lapply(entgeneranklist, gseWP, organism = "Homo sapiens", minGSSize = minset, maxGSSize = maxset)
+gwpwr <- lapply(gwpw, function(x){
+  temp <- dplyr::filter(x@result,p.adjust<=0.05)
+  return(temp)
+})
+
+for(i in 1:length(gwpw)) {
+  if(nrow(gwpwr[[i]])>0) {
+    p<-ridgeplot(gwpw[[i]], showCategory = ncat)
+    ggsave(filename=paste(names(gwpw)[i],"WikiPathway.tiff",sep="_"),plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+  }
+}
+
+#KEGG
+gkk <- lapply(unpgeneranklist, gseKEGG, organism = 'hsa', keyType = "uniprot", minGSSize = minset, maxGSSize = maxset)
+gkkr <- lapply(gkk, function(x){
+  temp <- dplyr::filter(x@result,p.adjust<=0.05)
+  return(temp)
+})
+
+for(i in 1:length(gkk)) {
+  if(nrow(gkkr[[i]])>0) {
+    p<-ridgeplot(gkk[[i]], showCategory = ncat)
+    ggsave(filename=paste(names(gkk)[i],"KEGG.tiff",sep="_"),plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+  }
+}
+```
+
+Comparing corrected and uncorrected data using batch correction metrics as a proxy for storage time correction metrics.
+```{r}
+time[[11]]<-Sys.time()
+
+seurat1 <- RunPCA(seurat1)
+seurat2 <- RunPCA(seurat2)
+
+seurat1 <- FindNeighbors(seurat1, dims = 1:10)
+seurat1 <- FindClusters(seurat1, resolution = 0.5)
+
+seurat2 <- FindNeighbors(seurat2, dims = 1:10)
+seurat2 <- FindClusters(seurat2, resolution = 0.5)
+
+seurat1<- RunUMAP(seurat1, dims = 1:10)
+seurat2<- RunUMAP(seurat2, dims = 1:10)
+
+p<-DimPlot(seurat1, reduction = "umap", group.by = "cell_type_cons", label = T, repel = T) + NoLegend() + labs(title="Uncorrected")
+ggsave(filename="Uncorrected UMAP.tiff",plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+p<-DimPlot(seurat2, reduction = "umap", group.by = "cell_type_cons", label = T, repel = T) + NoLegend() + labs(title="Corrected")
+ggsave(filename="Corrected UMAP.tiff",plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+
+p<-DimPlot(seurat1, reduction = "umap", group.by = "cell_type", label = T, repel = T) + NoLegend() + labs(title="Uncorrected")
+ggsave(filename="Uncorrected Diverse UMAP.tiff",plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+p<-DimPlot(seurat2, reduction = "umap", group.by = "cell_type", label = T, repel = T) + NoLegend() + labs(title="Corrected")
+ggsave(filename="Corrected Diverse UMAP.tiff",plot=p,device="tiff",height=10,width=10,path=temppath,create.dir=T)
+
+
+#test<-subset(seurat1, downsample=3000)
+#test2<-subset(seurat2, downsample=3000)
+
+time[[12]]<-Sys.time()
+
+metrics1 <- getIntegrationMetrics(seurat1, meta.label = "cell_type_cons", meta.batch = "disease", method.reduction = "umap")
+metrics2 <- getIntegrationMetrics(seurat2, meta.label = "cell_type_cons", meta.batch = "disease", method.reduction = "umap")
+
+saveRDS(metrics1,file=paste(temppath,"integration metrics uncorrected",sep="/"))
+saveRDS(metrics2,file=paste(temppath,"integration metrics corrected",sep="/"))
+
+temp <- as.data.frame(metrics1)
+temp <- rbind(temp,as.data.frame(metrics2))
+temp$correction <- c("Uncorrected","Corrected")
+
+p <- ggscatter(temp, x = "CiLISI", y = "iLISI", size = 3, shape = 16, color = "correction", palette = c("#191970","#8B3626"), xlab = "CiLISI", ylab = "iLISI", xlim = c(0,1), ylim = c(1,2))
+ggsave(filename="Integration Scores 1.tiff",plot=p,device="tiff",path=temppath,create.dir=T)
+p <- ggscatter(temp, x = "CiLISI", y = "celltype_ASW", size = 3, shape = 16, color = "correction", palette = c("#191970","#8B3626"), xlab = "CiLISI", ylab = "Celltype ASW", xlim = c(0,1), ylim = c(-0.1,1))
+ggsave(filename="Integration Scores 2.tiff",plot=p,device="tiff",path=temppath,create.dir=T)
+
+time[[13]]<-Sys.time()
+
+time<-lapply(time, toString)
+
+logging<-list(
+  time1 = paste("Program started at",time[[1]],sep=" "),
+  time2 = paste("Metadata acquired at",time[[2]],sep=" "),
+  time3 = paste("Rank pre-calculation started at",time[[3]],sep=" "),
+  time4 = paste("Score calculation started at",time[[4]],sep=" "),
+  time5 = paste("Score calculation finished at",time[[5]],sep=" "),
+  time6 = paste("Seurat Conversion started at",time[[6]],sep=" "),
+  time7 = paste("Seurat Conversion finished at",time[[7]],sep=" "),
+  time8 = paste("First scoring finished at",time[[8]],sep=" "),
+  time9 = paste("Second scoring finished at",time[[9]],sep=" "),
+  time10 = paste("GSEA started at",time[[10]],sep=" "),
+  time11 = paste("Clustering started at",time[[11]],sep=" "),
+  time12 = paste("Integration metrics calculation started at",time[[12]],sep=" "),
+  time13 = paste("Program finished at",time[[13]],sep=" "),
+  linebreak = ""
+)
+
+for(i in 1:length(mostsig)) {
+  temp <- paste(ntop[[i]],"(",ntopcent[[i]],"%)",sep="")
+  temp2 <- paste(nbot[[i]],"(",nbotcent[[i]],"%)",sep="")
+  stat<-list(paste("Top",temp,"upregulated and bottom",temp2,"downregulated genes used in",names(mostsig)[i],"signature",sep=" "))
+  logging<-append(logging,stat,after=length(logging))
+}
+
+write_delim(as.data.frame(logging), file=paste(plotpath,"/log.txt",sep=""),delim="\n",col_names=F)
+```
